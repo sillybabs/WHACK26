@@ -21,7 +21,11 @@ HOW IT WORKS
    (the average of the segments) and AVG, the average overall score since the
    video (re)started. In THIS version the big SCORE and AVG texts are hidden
    (SHOW_OVERALL_SCORE / SHOW_AVG_SCORE = False); everything else is the same.
-5. SCORE BAR: a vertical bar on the right edge of the live feed starts 50% green
+5. RUN SCORES: while the reference plays, every scored frame is recorded. When the
+   run ends (video finishes / loops, or you quit) the console shows POSITION,
+   TIMING, SHARPNESS, HOLDS (each 0-100) and OVERALL - see "RUN SCORES" below.
+6. SCORE BAR (hidden in this version: SHOW_SCORE_BAR = False): a vertical bar on
+   the right edge of the live feed starts 50% green
    / 50% red, like the evaluation bar on chess.com. Matching the video pushes it
    towards green, missing pushes it towards red, and a perfect run ends fully
    green. See the "SCORE BAR" section for how it is worked out.
@@ -162,7 +166,7 @@ COLOR_BAD = (0, 0, 255)       # anything lower            (red)
 #
 # Moments are stored by REFERENCE VIDEO TIME (0.1 s buckets), so replaying a
 # stretch overwrites it instead of adding to it. Pausing never counts.
-SHOW_SCORE_BAR = True
+SHOW_SCORE_BAR = False       # False = the bar is not displayed (set True to bring it back)
 SHOW_PART_SCORES = True      # write each segment's score on the body as well as in the table
 SHOW_OVERALL_SCORE = False   # the big "SCORE: nn" text at the bottom left of the live feed
 SHOW_AVG_SCORE = False       # the "AVG: nn" text above it
@@ -188,6 +192,34 @@ BALANCE_WARMUP_S = 3.0       # "running" only: damps the swings in the first sec
 # takes one dict:  {"time", "overall", "parts": {segment: score or None}, "balance"}
 # It is called once per frame while the reference is playing and a person is seen.
 SCORE_CALLBACK = None
+
+# =============================================================================
+# RUN SCORES - position, timing, sharpness, holds (see the "RUN SCORES" section)
+# =============================================================================
+# OVERALL = 0.75 position + 0.125 timing + 0.0625 sharpness + 0.0625 holds. If one
+# can't be measured (e.g. no clear holds) it's left out and the others re-weighted.
+WEIGHT_POSITION = 0.75
+WEIGHT_TIMING = 0.125
+WEIGHT_SHARPNESS = 0.0625
+WEIGHT_HOLDS = 0.0625
+
+# Events are found in each segment's angle over time: a movement, its arrival, a hold.
+EVENT_SMOOTH_S = 0.15        # smooth the angle this long before measuring speed
+EVENT_MOVE_DPS = 30.0        # degrees/second above which a segment counts as moving
+EVENT_MIN_MOVE_S = 0.10      # a movement must last at least this long
+EVENT_MIN_AMPLITUDE = 10.0   # ...and change the angle by at least this many degrees
+EVENT_MERGE_GAP_S = 0.10     # movements closer than this are treated as one
+EVENT_STABLE_MIN_S = 0.15    # must stay still this long afterwards to count as arrived
+EVENT_MATCH_WINDOW_S = 1.0   # pair your arrival with the reference one within this gap
+EVENT_MAX_GAP_S = 0.25       # a gap in the data longer than this splits it into pieces
+TIMING_TOL_S = 0.50          # arrival 0.5 s apart = 0 points (0 s = 100)
+SHARPNESS_TOL_S = 0.50       # movement duration 0.5 s apart = 0 points
+HOLD_TOL_S = 0.50            # hold duration 0.5 s apart = 0 points
+MIN_EVENTS_PER_COMPONENT = 1 # fewer matched events than this -> "unavailable"
+
+# Optional hook: set to a function taking one dict (the run scores above) - called
+# once when a run ends.
+RUN_SCORE_CALLBACK = None
 
 # =============================================================================
 # MODEL
@@ -313,6 +345,213 @@ class BalanceBar:
     def reset(self):
         self.v[:] = 0.0
         self.last = -1
+
+
+# =============================================================================
+# RUN SCORES - position, timing, sharpness, holds
+# =============================================================================
+# POSITION  - how closely your segment angles match the reference (the average of
+#             the per-frame overall score above).
+# TIMING    - do you ARRIVE at each pose at the same time as the reference?
+# SHARPNESS - do you complete each movement as fast as the reference?
+# HOLDS     - do you keep each pose for as long as the reference?
+# All are 0-100. Timing / sharpness / holds are measured from "events" found in each
+# segment's angle over time: a movement (angle changing fast enough), its arrival
+# (it stops), and the hold (it stays still until the next movement). Your events are
+# paired with the reference's in order, using the real video clock.
+def _smooth(t, a, win):
+    """Moving average of `a` over +-win/2 seconds (t sorted, no NaNs)."""
+    lo = np.searchsorted(t, t - win / 2, "left")
+    hi = np.searchsorted(t, t + win / 2, "right")
+    cs = np.concatenate([[0.0], np.cumsum(a)])
+    return (cs[hi] - cs[lo]) / (hi - lo)
+
+
+def _valid_pieces(t, a):
+    """Split a series into pieces with no missing values and no big time gaps.
+
+    Angles are unwrapped so +179 -> -179 counts as a 2 degree move, not 358.
+    """
+    pieces, start = [], None
+    for i in range(len(t)):
+        if np.isnan(a[i]):
+            if start is not None:
+                pieces.append((start, i))
+                start = None
+        elif start is None:
+            start = i
+        elif t[i] - t[i - 1] > EVENT_MAX_GAP_S:
+            pieces.append((start, i))
+            start = i
+    if start is not None:
+        pieces.append((start, len(t)))
+    for s, e in pieces:
+        if e - s >= 4:
+            yield t[s:e], np.degrees(np.unwrap(np.radians(a[s:e])))
+
+
+def detect_events(t, a):
+    """Find the movements in one angle-over-time series.
+
+    Returns a list of (start_s, arrival_s, hold_s). hold_s is None if the pose was
+    still being held when the data ran out (so that hold can't be measured).
+    """
+    events = []
+    for tt, aa in _valid_pieces(np.asarray(t, float), np.asarray(a, float)):
+        s = _smooth(tt, aa, EVENT_SMOOTH_S)
+        vel = np.zeros(len(tt))
+        dt = np.diff(tt)
+        vel[1:] = np.abs(np.diff(s) / np.where(dt > 0, dt, np.inf))
+        moving = vel > EVENT_MOVE_DPS
+
+        runs, i = [], 0
+        while i < len(moving):
+            if moving[i]:
+                j = i
+                while j + 1 < len(moving) and moving[j + 1]:
+                    j += 1
+                runs.append([i, j])
+                i = j + 1
+            else:
+                i += 1
+        merged = []
+        for r in runs:
+            if merged and tt[r[0]] - tt[merged[-1][1]] < EVENT_MERGE_GAP_S:
+                merged[-1][1] = r[1]
+            else:
+                merged.append(r)
+        good = [(r0, r1) for r0, r1 in merged
+                if tt[r1] - tt[r0] >= EVENT_MIN_MOVE_S
+                and np.ptp(s[max(0, r0 - 1):r1 + 1]) >= EVENT_MIN_AMPLITUDE]
+
+        for k, (r0, r1) in enumerate(good):
+            start_t, arr_t = float(tt[max(0, r0 - 1)]), float(tt[r1])
+            nxt = float(tt[max(0, good[k + 1][0] - 1)]) if k + 1 < len(good) else None
+            still_until = nxt if nxt is not None else float(tt[-1])
+            if still_until - arr_t < EVENT_STABLE_MIN_S:
+                continue            # didn't stay still: not a reliable arrival
+            events.append((start_t, arr_t, None if nxt is None else nxt - arr_t))
+    return events
+
+
+def _pair_events(ref_events, user_events):
+    """Pair reference and user events in order, by arrival time (within the match window)."""
+    pairs, j = [], 0
+    for r in ref_events:
+        while j < len(user_events) and user_events[j][1] < r[1] - EVENT_MATCH_WINDOW_S:
+            j += 1
+        if j < len(user_events) and abs(user_events[j][1] - r[1]) <= EVENT_MATCH_WINDOW_S:
+            pairs.append((r, user_events[j]))
+            j += 1
+    return pairs
+
+
+def _tol_score(diff_s, tol_s):
+    """0 s apart -> 100 points, tol_s or more apart -> 0."""
+    return max(0.0, min(100.0, 100.0 * (1.0 - diff_s / tol_s)))
+
+
+def _mean(values):
+    values = [v for v in values if v is not None]
+    return float(np.mean(values)) if values else None
+
+
+class RunRecorder:
+    """Collects the scored frames of one run and works out position / timing /
+    sharpness / holds when the run ends.
+
+    record() - call once per scored frame
+    finish() - returns {"overall", "position", "timing", "sharpness", "holds", ...}
+    """
+
+    def __init__(self, ref_data, ref_fps):
+        self.ref_data = ref_data
+        self.ref_fps = ref_fps
+        self.t = []        # video time of each scored frame
+        self.overall = []  # that frame's overall (position) score
+        self.live = []     # {segment: live angle or None}
+        self.done = False
+
+    def record(self, t, results, overall):
+        self.t.append(float(t))
+        self.overall.append(float(overall))
+        self.live.append({n: (None if r is None else r["live"]) for n, r in results.items()})
+
+    @property
+    def has_data(self):
+        return len(self.t) > 0
+
+    def _events(self):
+        """(segment, reference event, your event) for every pair that could be matched."""
+        ref_t = np.arange(len(self.ref_data)) / self.ref_fps
+        user_t = np.array(self.t)
+        names = sorted({n for p in self.live for n in p})
+        out = []
+        for name in names:
+            ref_a = np.array([np.nan if ang is None or ang.get(name) is None else ang[name]
+                              for _, ang in self.ref_data], float)
+            user_a = np.array([np.nan if p.get(name) is None else p[name]
+                               for p in self.live], float)
+            for r, u in _pair_events(detect_events(ref_t, ref_a), detect_events(user_t, user_a)):
+                out.append((name, r, u))
+        return out
+
+    def finish(self):
+        pairs = self._events()
+        timing_l = [_tol_score(abs(u[1] - r[1]), TIMING_TOL_S) for _, r, u in pairs]
+        sharp_l = [_tol_score(abs((u[1] - u[0]) - (r[1] - r[0])), SHARPNESS_TOL_S)
+                   for _, r, u in pairs]
+        hold_l = [_tol_score(abs(u[2] - r[2]), HOLD_TOL_S)
+                  for _, r, u in pairs if r[2] is not None and u[2] is not None]
+
+        position = _mean(self.overall)
+        timing = _mean(timing_l) if len(timing_l) >= MIN_EVENTS_PER_COMPONENT else None
+        sharp = _mean(sharp_l) if len(sharp_l) >= MIN_EVENTS_PER_COMPONENT else None
+        holds = _mean(hold_l) if len(hold_l) >= MIN_EVENTS_PER_COMPONENT else None
+
+        # OVERALL = weighted mix of what could be measured. A component that couldn't be
+        # measured is left out and the others re-weighted - it never counts as 100.
+        comps = {"position": (position, WEIGHT_POSITION), "timing": (timing, WEIGHT_TIMING),
+                 "sharpness": (sharp, WEIGHT_SHARPNESS), "holds": (holds, WEIGHT_HOLDS)}
+        have = {k: c for k, c in comps.items() if c[0] is not None}
+        overall = (sum(v * w for v, w in have.values()) / sum(w for _, w in have.values())
+                   if have and position is not None else None)
+        return {
+            "overall": overall, "position": position, "timing": timing,
+            "sharpness": sharp, "holds": holds,
+            "unavailable": [k for k, (v, _) in comps.items() if v is None],
+            "matched_events": len(pairs), "scored_frames": len(self.t),
+            # per-event detail: how much later / slower / longer you were (ms)
+            "events": [{
+                "segment": n,
+                "arrival_offset_ms": round((u[1] - r[1]) * 1000),                 # + = later
+                "duration_diff_ms": round(((u[1] - u[0]) - (r[1] - r[0])) * 1000),  # + = slower
+                "hold_diff_ms": (None if r[2] is None or u[2] is None
+                                 else round((u[2] - r[2]) * 1000)),
+            } for n, r, u in pairs],
+        }
+
+
+def finish_run(recorder, complete=True):
+    """Work out and print the run scores (once per run). Returns the result dict."""
+    if recorder is None or recorder.done or not recorder.has_data:
+        return None
+    if not complete and recorder.t[-1] - recorder.t[0] < 2.0:
+        return None             # a few frames from a stopped run isn't worth reporting
+    recorder.done = True
+    res = recorder.finish()
+    f = lambda v: "unavailable" if v is None else f"{v:.0f}"
+    print("\n=== RUN SCORES (out of 100) ===")
+    print(f"OVERALL {f(res['overall'])} | POSITION {f(res['position'])} | "
+          f"TIMING {f(res['timing'])} | SHARPNESS {f(res['sharpness'])} | "
+          f"HOLDS {f(res['holds'])}")
+    if res["unavailable"]:
+        print("Not measurable this run (left out of OVERALL):", ", ".join(res["unavailable"]))
+    if not complete:
+        print("(run was stopped before the video finished)")
+    if RUN_SCORE_CALLBACK is not None:
+        RUN_SCORE_CALLBACK(res)
+    return res
 
 
 # =============================================================================
@@ -692,6 +931,7 @@ def main(video_path=None):
     player = ReferencePlayer(path, data, ref_fps)
     balance = BalanceBar(player.n / player.fps)   # the chess.com-style bar
     smoother = ScoreSmoother()
+    recorder = RunRecorder(data, ref_fps)         # position / timing / sharpness / holds
 
     options = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -729,9 +969,13 @@ def main(video_path=None):
 
             # Advance the reference video; a loop restarts the running average and the bar
             if player.update(dt):
+                finish_run(recorder)                  # the run that just ended
+                recorder = RunRecorder(data, ref_fps)
                 score_sum, score_count = 0.0, 0
                 balance.reset()
                 smoother.reset()
+            elif player.finished:                     # LOOP_REFERENCE = False: video ended
+                finish_run(recorder)
             _, ref_angles = player.current
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -759,6 +1003,7 @@ def main(video_path=None):
                 if overall is not None and player.playing:
                     score_sum += overall
                     score_count += 1
+                    recorder.record(player.time, results, overall)
 
                     # Score bar: smooth the overall score, band it, store it at this video time
                     smooth = smoother.update(overall, time.time())
@@ -781,8 +1026,8 @@ def main(video_path=None):
                         for n, r in results.items()
                     ]
                     total = f"{overall:.0f}" if overall is not None else "--"
-                    print(f"TOTAL {total} | BAR {balance.value * 100:.0f}% | "
-                          + " | ".join(parts))
+                    bar_txt = f"BAR {balance.value * 100:.0f}% | " if SHOW_SCORE_BAR else ""
+                    print(f"TOTAL {total} | {bar_txt}" + " | ".join(parts))
 
             if SHOW_SCORE_BAR:
                 draw_score_bar(frame, balance.value)
@@ -816,6 +1061,7 @@ def main(video_path=None):
                 score_sum, score_count = 0.0, 0
                 balance.reset()
                 smoother.reset()
+                recorder = RunRecorder(data, ref_fps)   # discard the run so far
 
             # Cap the frame rate by sleeping off any leftover frame time
             elapsed = time.time() - loop_start
@@ -825,9 +1071,11 @@ def main(video_path=None):
     cap.release()
     player.release()
     cv2.destroyAllWindows()
+    finish_run(recorder, complete=False)   # a run stopped early is still reported
     if score_count:
         print(f"Average score: {score_sum / score_count:.0f}")
-        print(f"Final score bar: {balance.value * 100:.0f}% green")
+        if SHOW_SCORE_BAR:
+            print(f"Final score bar: {balance.value * 100:.0f}% green")
 
 
 if __name__ == "__main__":
