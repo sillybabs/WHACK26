@@ -1,6 +1,6 @@
 import threading
 import numpy as np
-import WHACK26.config as config
+import config
 
 
 class BalanceBar:
@@ -14,7 +14,7 @@ class BalanceBar:
         self.lock = threading.Lock()
 
     def _index(self, ref_t: float) -> int:
-        return min(self.n - 1, max(0, int(ref_t / self.bucket_s)))
+        return min(self.n - 1, max(0, int(ref_t / self.bucket_s + 1e-9)))
 
     def record(self, ref_t: float, band: str) -> None:
         val = {"green": 1.0, "amber": config.BALANCE_AMBER_VALUE, "red": -1.0}[band]
