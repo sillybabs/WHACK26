@@ -10,7 +10,7 @@ Rules it enforces:
 import math
 from collections import defaultdict
 
-import config
+import WHACK26.config as config
 from scoring import events, findings
 from scoring.common import (JOINTS, UNAVAILABLE_PARTS, COMPONENTS, error_to_score, mean,
                             section_index_at, section_bounds, n_sections, static_band)

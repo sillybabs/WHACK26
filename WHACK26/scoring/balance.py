@@ -1,6 +1,6 @@
 import threading
 import numpy as np
-import config
+import WHACK26.config as config
 
 
 class BalanceBar:

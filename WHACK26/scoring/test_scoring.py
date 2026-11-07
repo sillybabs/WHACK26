@@ -1,4 +1,4 @@
-"""tests/test_scoring.py - the spec's acceptance table (section 16), on synthetic dancers.
+"""tests/test_scoring.py - the spec's acceptance table (section 17), on synthetic dancers.
 Run from the project root:  python tests/test_scoring.py   (or pytest)"""
 import copy
 import json
@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
+import WHACK26.config as config
 from scoring import loop, llm_feedback
 from scoring.common import JOINTS, swap_lr
 from scoring.recorder import combine

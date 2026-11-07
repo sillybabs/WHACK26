@@ -1,6 +1,6 @@
 """scoring/position.py - Component A: position & angle accuracy (spec 3)."""
 import bisect
-import config
+import WHACK26.config as config
 from scoring.common import JOINTS, JOINT_PART
 
 

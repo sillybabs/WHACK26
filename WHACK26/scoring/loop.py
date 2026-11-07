@@ -17,7 +17,7 @@ import json
 import threading
 import time
 
-import config
+import WHACK26.config as config
 from scoring import events, llm_feedback, position
 from scoring.balance import BalanceBar
 from scoring.common import (error_to_score, mirror_frame, section_index_at, strip_private)

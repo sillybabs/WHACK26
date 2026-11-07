@@ -10,7 +10,7 @@ import concurrent.futures
 import json
 import re
 
-import config
+import WHACK26.config as config
 from scoring.common import COMPONENTS, normalise_part, pretty, round_half_up
 
 STATUSES = ("strong", "good", "improving", "needs_work", "unavailable")

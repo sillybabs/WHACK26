@@ -1,7 +1,7 @@
 """scoring/live.py - the small live trackers: smoothing, band hold, weakest joint, streak.
 Each takes `now` (seconds) so tests can drive a fake clock."""
 from collections import deque
-import config
+import WHACK26.config as config
 from scoring.common import static_band
 
 

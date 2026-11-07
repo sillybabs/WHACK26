@@ -8,7 +8,7 @@ A stable run longer than HOLD_MIN_S is a HOLD.
 Everything here uses the ORIGINAL video timestamps. Nothing is time-shifted, so lateness shows up.
 Events that are unclear are simply not detected and not scored (spec 4.1: no forced matches).
 """
-import config
+import WHACK26.config as config
 from scoring.common import JOINTS, JOINT_PART, swap_lr, section_index_at, linear_score
 
 

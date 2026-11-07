@@ -1,6 +1,6 @@
 """scoring/findings.py - ranked, evidence-backed findings (spec 11: top_findings).
 Python decides what the issues are. The LLM only explains them."""
-import config
+import WHACK26.config as config
 from scoring.common import error_to_score, joint_direction
 
 

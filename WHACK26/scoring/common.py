@@ -1,6 +1,6 @@
 """scoring/common.py - names, maths and small helpers shared by every scoring file."""
 import math
-import config
+import WHACK26.config as config
 
 JOINTS = [
     "left_elbow", "right_elbow", "left_shoulder", "right_shoulder",
