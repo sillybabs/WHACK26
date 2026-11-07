@@ -18,11 +18,11 @@ import threading
 import time
 
 import config
-from Scoring import events, llm_feedback, position
-from Scoring.balance import BalanceBar
-from Scoring.common import (error_to_score, mirror_frame, section_index_at, strip_private)
-from Scoring.live import BandTracker, ScoreSmoother, StreakCounter, WorstJointTracker
-from Scoring.recorder import RunRecorder
+from scoring import events, llm_feedback, position
+from scoring.balance import BalanceBar
+from scoring.common import (error_to_score, mirror_frame, section_index_at, strip_private)
+from scoring.live import BandTracker, ScoreSmoother, StreakCounter, WorstJointTracker
+from scoring.recorder import RunRecorder
 
 _lock = threading.RLock()
 
