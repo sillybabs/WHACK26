@@ -39,7 +39,7 @@ straight down, as seen on screen:
 Because only angle DIFFERENCES matter, the sign convention is just used
 consistently for both the live feed and the reference.
 
-SCORING (all tunable in the "SCORING" section)
+SCORING (all tunable in scoring/config.py)
 ----------------------------------------------
     difference 0-20 deg   -> 100 down to 60 points   (band 1)
     difference 20-40 deg  -> 59 down to 20 points    (band 2)
@@ -48,7 +48,7 @@ Inside a band the score falls in a straight line. Examples:
     10 deg off -> 80,  20 deg -> 60,  30 deg -> 39.5,  40 deg -> 20,  50 deg -> 9.5
 Band 3 needs an end point (the brief says "more than 40"), so I assumed it
 reaches 0 points at 60 deg difference and stays 0 beyond that. Change
-BAND3_MAX_DIFF if you want a gentler or harsher fall-off.
+BAND3_MAX_DIFF (in scoring/config.py) if you want a gentler or harsher fall-off.
 
 SETUP
 -----
@@ -92,13 +92,29 @@ import os
 import sys
 import time
 import urllib.request
-from collections import deque
 
 import cv2
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+
+# The scoring code lives in /scoring, next to this /sandbox folder. Make the folder
+# above this script importable so "import scoring" works wherever you run from.
+try:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _SCRIPT_DIR = os.getcwd()
+_PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+
+from scoring import (  # noqa: E402
+    BalanceBar, RunRecorder, ScoreSmoother, balance_band, color_for_score, compare,
+    overall_score,
+)
+from scoring import finish_run as _finish_run  # noqa: E402
+from scoring.config import COLOR_BAD, COLOR_GOOD  # noqa: E402  (used by draw_score_bar)
 
 # =============================================================================
 # CONFIG
@@ -120,39 +136,10 @@ PRINT_SCORES = True       # also print the scores to the console
 PRINT_INTERVAL = 0.5      # seconds between console prints
 
 # =============================================================================
-# SCORING - point ranges stored as variables
+# SCORING SETTINGS
 # =============================================================================
-# Each band covers a range of angle differences (in degrees). At the START of
-# the band you get *_SCORE_HIGH points, at the END you get *_SCORE_LOW points,
-# and in between the score falls linearly.
-
-# Band 1: 0 -> 20 degrees difference  =>  100 -> 60 points
-BAND1_MAX_DIFF = 20
-BAND1_SCORE_HIGH = 100
-BAND1_SCORE_LOW = 60
-
-# Band 2: 20 -> 40 degrees difference  =>  59 -> 20 points
-BAND2_MAX_DIFF = 40
-BAND2_SCORE_HIGH = 59
-BAND2_SCORE_LOW = 20
-
-# Band 3: 40 -> BAND3_MAX_DIFF degrees difference  =>  19 -> 0 points
-# (BAND3_MAX_DIFF = 60 is my assumption; beyond it the score stays at 0)
-BAND3_MAX_DIFF = 60
-BAND3_SCORE_HIGH = 19
-BAND3_SCORE_LOW = 0
-
-# (start_diff, end_diff, score_at_start, score_at_end) for each band
-SCORE_BANDS = [
-    (0,              BAND1_MAX_DIFF, BAND1_SCORE_HIGH, BAND1_SCORE_LOW),
-    (BAND1_MAX_DIFF, BAND2_MAX_DIFF, BAND2_SCORE_HIGH, BAND2_SCORE_LOW),
-    (BAND2_MAX_DIFF, BAND3_MAX_DIFF, BAND3_SCORE_HIGH, BAND3_SCORE_LOW),
-]
-
-# Display colours (BGR). Used for the skeleton and score text.
-COLOR_GOOD = (0, 200, 0)      # score >= BAND1_SCORE_LOW  (green)
-COLOR_OK = (0, 165, 255)      # score >= BAND2_SCORE_LOW  (orange)
-COLOR_BAD = (0, 0, 255)       # anything lower            (red)
+# The point bands, colours, score-bar tuning and run-score weights all live in
+# scoring/config.py now. Edit them there.
 
 # =============================================================================
 # SCORE BAR (chess.com style)
@@ -170,23 +157,7 @@ SHOW_SCORE_BAR = False       # False = the bar is not displayed (set True to bri
 SHOW_PART_SCORES = True      # write each segment's score on the body as well as in the table
 SHOW_OVERALL_SCORE = False   # the big "SCORE: nn" text at the bottom left of the live feed
 SHOW_AVG_SCORE = False       # the "AVG: nn" text above it
-BALANCE_BUCKET_S = 0.1
-BALANCE_AMBER_VALUE = 0.0    # orange counts as neutral; try 0.3 if the bar feels too harsh
-BALANCE_SMOOTH_S = 0.4       # smooth the overall score this long before it is banded
-# Cut-offs for what pushes the bar. These are the team spec's bands (green 80+,
-# amber 60-79, red below 60), NOT the skeleton colours, so the bar reacts to a
-# mediocre stretch instead of only to a disaster. (Using the skeleton cut-offs of
-# 60 / 20 makes red almost impossible, so the bar could only ever go up.)
-BALANCE_GREEN_MIN = 80
-BALANCE_AMBER_MIN = 60
-# How the bar is scaled:
-#   "running"    - divided by the time played SO FAR (but at least BALANCE_WARMUP_S),
-#                  so it rises and falls with how you are doing. Ends the same as
-#                  "whole_clip" once the video is over.
-#   "whole_clip" - divided by the whole video length: steadier but very slow, and it
-#                  can only reach full green at the very end.
-BALANCE_MODE = "running"
-BALANCE_WARMUP_S = 3.0       # "running" only: damps the swings in the first seconds
+# (BALANCE_* tuning values for the bar are in scoring/config.py)
 
 # Optional hook so other code can receive the scores. Set it to a function that
 # takes one dict:  {"time", "overall", "parts": {segment: score or None}, "balance"}
@@ -194,29 +165,8 @@ BALANCE_WARMUP_S = 3.0       # "running" only: damps the swings in the first sec
 SCORE_CALLBACK = None
 
 # =============================================================================
-# RUN SCORES - position, timing, sharpness, holds (see the "RUN SCORES" section)
+# RUN SCORE HOOK
 # =============================================================================
-# OVERALL = 0.75 position + 0.125 timing + 0.0625 sharpness + 0.0625 holds. If one
-# can't be measured (e.g. no clear holds) it's left out and the others re-weighted.
-WEIGHT_POSITION = 0.75
-WEIGHT_TIMING = 0.125
-WEIGHT_SHARPNESS = 0.0625
-WEIGHT_HOLDS = 0.0625
-
-# Events are found in each segment's angle over time: a movement, its arrival, a hold.
-EVENT_SMOOTH_S = 0.15        # smooth the angle this long before measuring speed
-EVENT_MOVE_DPS = 30.0        # degrees/second above which a segment counts as moving
-EVENT_MIN_MOVE_S = 0.10      # a movement must last at least this long
-EVENT_MIN_AMPLITUDE = 10.0   # ...and change the angle by at least this many degrees
-EVENT_MERGE_GAP_S = 0.10     # movements closer than this are treated as one
-EVENT_STABLE_MIN_S = 0.15    # must stay still this long afterwards to count as arrived
-EVENT_MATCH_WINDOW_S = 1.0   # pair your arrival with the reference one within this gap
-EVENT_MAX_GAP_S = 0.25       # a gap in the data longer than this splits it into pieces
-TIMING_TOL_S = 0.50          # arrival 0.5 s apart = 0 points (0 s = 100)
-SHARPNESS_TOL_S = 0.50       # movement duration 0.5 s apart = 0 points
-HOLD_TOL_S = 0.50            # hold duration 0.5 s apart = 0 points
-MIN_EVENTS_PER_COMPONENT = 1 # fewer matched events than this -> "unavailable"
-
 # Optional hook: set to a function taking one dict (the run scores above) - called
 # once when a run ends.
 RUN_SCORE_CALLBACK = None
@@ -265,293 +215,12 @@ HEAD_SEGMENT = ("head", (7, 8), (11, 12))  # ear midpoint -> shoulder midpoint
 
 
 # =============================================================================
-# SCORING FUNCTIONS
 # =============================================================================
-def angle_diff(live, ref):
-    """Signed difference live - ref, wrapped to -180..180 (so +179 vs -179 = 2)."""
-    return (live - ref + 180) % 360 - 180
-
-
-def score_diff(diff):
-    """Turn an angle difference (degrees, sign ignored) into 0-100 points."""
-    d = abs(diff)
-    for start, end, score_high, score_low in SCORE_BANDS:
-        if d <= end:
-            t = (d - start) / (end - start)  # 0 at band start, 1 at band end
-            return score_high + t * (score_low - score_high)
-    return BAND3_SCORE_LOW  # past the last band
-
-
-def color_for_score(score):
-    if score >= BAND1_SCORE_LOW:
-        return COLOR_GOOD
-    if score >= BAND2_SCORE_LOW:
-        return COLOR_OK
-    return COLOR_BAD
-
-
+# SCORING HOOKS
 # =============================================================================
-# SCORE BAR LOGIC
-# =============================================================================
-class ScoreSmoother:
-    """Average of the overall score over the last `window_s` seconds."""
-
-    def __init__(self, window_s=BALANCE_SMOOTH_S):
-        self.window_s = window_s
-        self.hist = deque()
-
-    def update(self, value, now):
-        self.hist.append((now, value))
-        while self.hist and now - self.hist[0][0] > self.window_s:
-            self.hist.popleft()
-        return sum(v for _, v in self.hist) / len(self.hist)
-
-    def reset(self):
-        self.hist.clear()
-
-
-def balance_band(score):
-    """'green' / 'amber' / 'red' for a smoothed overall score (same cut-offs as the colours)."""
-    if score >= BALANCE_GREEN_MIN:
-        return "green"
-    if score >= BALANCE_AMBER_MIN:
-        return "amber"
-    return "red"
-
-
-class BalanceBar:
-    """Starts at 0.5 (50% green). Ends at 1.0 if every moment of the video is green."""
-
-    def __init__(self, clip_seconds):
-        self.n = max(1, int(math.ceil(clip_seconds / BALANCE_BUCKET_S)))
-        self.v = np.zeros(self.n, dtype=np.float32)   # +1 green, amber value, -1 red
-        self.last = -1                                # furthest bucket played so far
-
-    def record(self, video_t, band):
-        i = min(self.n - 1, max(0, int(video_t / BALANCE_BUCKET_S + 1e-9)))
-        self.v[i] = {"green": 1.0, "amber": BALANCE_AMBER_VALUE, "red": -1.0}[band]
-        self.last = max(self.last, i)
-
-    @property
-    def value(self):
-        """0..1, the green share of the bar."""
-        if BALANCE_MODE == "running":
-            warmup = int(BALANCE_WARMUP_S / BALANCE_BUCKET_S)
-            denom = min(self.n, max(self.last + 1, warmup, 1))
-        else:
-            denom = self.n
-        return float(min(1.0, max(0.0, 0.5 + 0.5 * self.v.sum() / denom)))
-
-    def reset(self):
-        self.v[:] = 0.0
-        self.last = -1
-
-
-# =============================================================================
-# RUN SCORES - position, timing, sharpness, holds
-# =============================================================================
-# POSITION  - how closely your segment angles match the reference (the average of
-#             the per-frame overall score above).
-# TIMING    - do you ARRIVE at each pose at the same time as the reference?
-# SHARPNESS - do you complete each movement as fast as the reference?
-# HOLDS     - do you keep each pose for as long as the reference?
-# All are 0-100. Timing / sharpness / holds are measured from "events" found in each
-# segment's angle over time: a movement (angle changing fast enough), its arrival
-# (it stops), and the hold (it stays still until the next movement). Your events are
-# paired with the reference's in order, using the real video clock.
-def _smooth(t, a, win):
-    """Moving average of `a` over +-win/2 seconds (t sorted, no NaNs)."""
-    lo = np.searchsorted(t, t - win / 2, "left")
-    hi = np.searchsorted(t, t + win / 2, "right")
-    cs = np.concatenate([[0.0], np.cumsum(a)])
-    return (cs[hi] - cs[lo]) / (hi - lo)
-
-
-def _valid_pieces(t, a):
-    """Split a series into pieces with no missing values and no big time gaps.
-
-    Angles are unwrapped so +179 -> -179 counts as a 2 degree move, not 358.
-    """
-    pieces, start = [], None
-    for i in range(len(t)):
-        if np.isnan(a[i]):
-            if start is not None:
-                pieces.append((start, i))
-                start = None
-        elif start is None:
-            start = i
-        elif t[i] - t[i - 1] > EVENT_MAX_GAP_S:
-            pieces.append((start, i))
-            start = i
-    if start is not None:
-        pieces.append((start, len(t)))
-    for s, e in pieces:
-        if e - s >= 4:
-            yield t[s:e], np.degrees(np.unwrap(np.radians(a[s:e])))
-
-
-def detect_events(t, a):
-    """Find the movements in one angle-over-time series.
-
-    Returns a list of (start_s, arrival_s, hold_s). hold_s is None if the pose was
-    still being held when the data ran out (so that hold can't be measured).
-    """
-    events = []
-    for tt, aa in _valid_pieces(np.asarray(t, float), np.asarray(a, float)):
-        s = _smooth(tt, aa, EVENT_SMOOTH_S)
-        vel = np.zeros(len(tt))
-        dt = np.diff(tt)
-        vel[1:] = np.abs(np.diff(s) / np.where(dt > 0, dt, np.inf))
-        moving = vel > EVENT_MOVE_DPS
-
-        runs, i = [], 0
-        while i < len(moving):
-            if moving[i]:
-                j = i
-                while j + 1 < len(moving) and moving[j + 1]:
-                    j += 1
-                runs.append([i, j])
-                i = j + 1
-            else:
-                i += 1
-        merged = []
-        for r in runs:
-            if merged and tt[r[0]] - tt[merged[-1][1]] < EVENT_MERGE_GAP_S:
-                merged[-1][1] = r[1]
-            else:
-                merged.append(r)
-        good = [(r0, r1) for r0, r1 in merged
-                if tt[r1] - tt[r0] >= EVENT_MIN_MOVE_S
-                and np.ptp(s[max(0, r0 - 1):r1 + 1]) >= EVENT_MIN_AMPLITUDE]
-
-        for k, (r0, r1) in enumerate(good):
-            start_t, arr_t = float(tt[max(0, r0 - 1)]), float(tt[r1])
-            nxt = float(tt[max(0, good[k + 1][0] - 1)]) if k + 1 < len(good) else None
-            still_until = nxt if nxt is not None else float(tt[-1])
-            if still_until - arr_t < EVENT_STABLE_MIN_S:
-                continue            # didn't stay still: not a reliable arrival
-            events.append((start_t, arr_t, None if nxt is None else nxt - arr_t))
-    return events
-
-
-def _pair_events(ref_events, user_events):
-    """Pair reference and user events in order, by arrival time (within the match window)."""
-    pairs, j = [], 0
-    for r in ref_events:
-        while j < len(user_events) and user_events[j][1] < r[1] - EVENT_MATCH_WINDOW_S:
-            j += 1
-        if j < len(user_events) and abs(user_events[j][1] - r[1]) <= EVENT_MATCH_WINDOW_S:
-            pairs.append((r, user_events[j]))
-            j += 1
-    return pairs
-
-
-def _tol_score(diff_s, tol_s):
-    """0 s apart -> 100 points, tol_s or more apart -> 0."""
-    return max(0.0, min(100.0, 100.0 * (1.0 - diff_s / tol_s)))
-
-
-def _mean(values):
-    values = [v for v in values if v is not None]
-    return float(np.mean(values)) if values else None
-
-
-class RunRecorder:
-    """Collects the scored frames of one run and works out position / timing /
-    sharpness / holds when the run ends.
-
-    record() - call once per scored frame
-    finish() - returns {"overall", "position", "timing", "sharpness", "holds", ...}
-    """
-
-    def __init__(self, ref_data, ref_fps):
-        self.ref_data = ref_data
-        self.ref_fps = ref_fps
-        self.t = []        # video time of each scored frame
-        self.overall = []  # that frame's overall (position) score
-        self.live = []     # {segment: live angle or None}
-        self.done = False
-
-    def record(self, t, results, overall):
-        self.t.append(float(t))
-        self.overall.append(float(overall))
-        self.live.append({n: (None if r is None else r["live"]) for n, r in results.items()})
-
-    @property
-    def has_data(self):
-        return len(self.t) > 0
-
-    def _events(self):
-        """(segment, reference event, your event) for every pair that could be matched."""
-        ref_t = np.arange(len(self.ref_data)) / self.ref_fps
-        user_t = np.array(self.t)
-        names = sorted({n for p in self.live for n in p})
-        out = []
-        for name in names:
-            ref_a = np.array([np.nan if ang is None or ang.get(name) is None else ang[name]
-                              for _, ang in self.ref_data], float)
-            user_a = np.array([np.nan if p.get(name) is None else p[name]
-                               for p in self.live], float)
-            for r, u in _pair_events(detect_events(ref_t, ref_a), detect_events(user_t, user_a)):
-                out.append((name, r, u))
-        return out
-
-    def finish(self):
-        pairs = self._events()
-        timing_l = [_tol_score(abs(u[1] - r[1]), TIMING_TOL_S) for _, r, u in pairs]
-        sharp_l = [_tol_score(abs((u[1] - u[0]) - (r[1] - r[0])), SHARPNESS_TOL_S)
-                   for _, r, u in pairs]
-        hold_l = [_tol_score(abs(u[2] - r[2]), HOLD_TOL_S)
-                  for _, r, u in pairs if r[2] is not None and u[2] is not None]
-
-        position = _mean(self.overall)
-        timing = _mean(timing_l) if len(timing_l) >= MIN_EVENTS_PER_COMPONENT else None
-        sharp = _mean(sharp_l) if len(sharp_l) >= MIN_EVENTS_PER_COMPONENT else None
-        holds = _mean(hold_l) if len(hold_l) >= MIN_EVENTS_PER_COMPONENT else None
-
-        # OVERALL = weighted mix of what could be measured. A component that couldn't be
-        # measured is left out and the others re-weighted - it never counts as 100.
-        comps = {"position": (position, WEIGHT_POSITION), "timing": (timing, WEIGHT_TIMING),
-                 "sharpness": (sharp, WEIGHT_SHARPNESS), "holds": (holds, WEIGHT_HOLDS)}
-        have = {k: c for k, c in comps.items() if c[0] is not None}
-        overall = (sum(v * w for v, w in have.values()) / sum(w for _, w in have.values())
-                   if have and position is not None else None)
-        return {
-            "overall": overall, "position": position, "timing": timing,
-            "sharpness": sharp, "holds": holds,
-            "unavailable": [k for k, (v, _) in comps.items() if v is None],
-            "matched_events": len(pairs), "scored_frames": len(self.t),
-            # per-event detail: how much later / slower / longer you were (ms)
-            "events": [{
-                "segment": n,
-                "arrival_offset_ms": round((u[1] - r[1]) * 1000),                 # + = later
-                "duration_diff_ms": round(((u[1] - u[0]) - (r[1] - r[0])) * 1000),  # + = slower
-                "hold_diff_ms": (None if r[2] is None or u[2] is None
-                                 else round((u[2] - r[2]) * 1000)),
-            } for n, r, u in pairs],
-        }
-
-
 def finish_run(recorder, complete=True):
-    """Work out and print the run scores (once per run). Returns the result dict."""
-    if recorder is None or recorder.done or not recorder.has_data:
-        return None
-    if not complete and recorder.t[-1] - recorder.t[0] < 2.0:
-        return None             # a few frames from a stopped run isn't worth reporting
-    recorder.done = True
-    res = recorder.finish()
-    f = lambda v: "unavailable" if v is None else f"{v:.0f}"
-    print("\n=== RUN SCORES (out of 100) ===")
-    print(f"OVERALL {f(res['overall'])} | POSITION {f(res['position'])} | "
-          f"TIMING {f(res['timing'])} | SHARPNESS {f(res['sharpness'])} | "
-          f"HOLDS {f(res['holds'])}")
-    if res["unavailable"]:
-        print("Not measurable this run (left out of OVERALL):", ", ".join(res["unavailable"]))
-    if not complete:
-        print("(run was stopped before the video finished)")
-    if RUN_SCORE_CALLBACK is not None:
-        RUN_SCORE_CALLBACK(res)
-    return res
+    """Score the finished run (see scoring/run_scores.py) and call RUN_SCORE_CALLBACK."""
+    return _finish_run(recorder, complete, callback=RUN_SCORE_CALLBACK)
 
 
 # =============================================================================
@@ -600,34 +269,6 @@ def segment_angles(segs):
         for name, (p, q) in segs.items()
     }
 
-
-# =============================================================================
-# COMPARISON
-# =============================================================================
-def compare(live_angles, ref_angles):
-    """Score every segment. Returns {name: dict or None}.
-
-    Each dict has: live, ref (angles), diff (signed, wrapped), score (0-100).
-    A segment is None if it isn't visible in the live feed or the reference
-    (or if the reference has no person in the current frame).
-    """
-    results = {}
-    for name, live in live_angles.items():
-        ref = ref_angles.get(name)
-        if live is None or ref is None:
-            results[name] = None
-            continue
-        diff = angle_diff(live, ref)
-        results[name] = {
-            "live": live, "ref": ref, "diff": diff, "score": score_diff(diff),
-        }
-    return results
-
-
-def overall_score(results):
-    """Average score of all segments that could be compared (None if none)."""
-    scores = [r["score"] for r in results.values() if r is not None]
-    return sum(scores) / len(scores) if scores else None
 
 
 # =============================================================================
