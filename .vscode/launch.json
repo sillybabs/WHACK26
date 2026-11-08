@@ -1,14 +1,36 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    // Paths use ${workspaceFolder}, so these work for anyone who opens the repo folder.
     "version": "0.2.0",
     "configurations": [
         {
             "type": "chrome",
             "request": "launch",
-            "name": "Open index.html",
-            "file": "/Users/pranavbibin/Documents/GitHub/WHACK26/web/index.html"
+            "name": "Open index.html (fake mode)",
+            "file": "${workspaceFolder}/web/index.html"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Live coach (webcam + web page)",
+            "program": "${workspaceFolder}/sandbox/pose_webcam.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Debrief server (no camera)",
+            "program": "${workspaceFolder}/to_claude_program/debrief_server.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Debrief to files (main.py)",
+            "program": "${workspaceFolder}/to_claude_program/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
         }
     ]
 }
