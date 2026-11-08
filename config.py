@@ -1,86 +1,83 @@
+"""config.py  (owned by B)
+
+Every number the scoring code uses lives here, so tuning never means editing logic.
+Values marked (spec) come straight from Scoring + LLM Feedback Spec v3.
+Everything else is a v1 starting value to tune with real dancers.
 """
-Tunable settings for the scoring package (moved unchanged from pose_webcam.py).
 
-Edit the numbers here to change how the live scoring behaves.
-"""
+# ---------------------------------------------------------------- run structure
+SECTION_SECONDS = 4.0          # (spec 9) 4 s sections
+BPM = None                     # if set, section length = 8 * 60 / BPM
+WINDOW_S = 0.5                 # (spec 3) look-back for the LIVE position score only
+MIRROR = True
+AUTO_PAUSE = True
+RESTART_QUIET_S = 0.5          # (spec 15) no scoring for 0.5 s after a restart
 
-# =============================================================================
-# FRAME SCORING - point ranges stored as variables
-# =============================================================================
-# Each band covers a range of angle differences (in degrees). At the START of
-# the band you get *_SCORE_HIGH points, at the END you get *_SCORE_LOW points,
-# and in between the score falls linearly.
+# ---------------------------------------------------------------- position (spec 3)
+ERR_AT_ZERO_SCORE = 50.0       # P = clamp(100 * (1 - E / 50), 0, 100)
+SCORE_SMOOTH_S = 0.4           # rolling smoothing of the live score
+MIN_ACTIVE_JOINTS = 3          # fewer comparable joints than this = frame not scored
+JOINT_WEIGHTS = {              # (spec 3) equal to start, configurable
+    "left_elbow": 1.0, "right_elbow": 1.0,
+    "left_shoulder": 1.0, "right_shoulder": 1.0,
+    "left_knee": 1.0, "right_knee": 1.0,
+    "left_hip": 1.0, "right_hip": 1.0,
+}
 
-# Band 1: 0 -> 20 degrees difference  =>  100 -> 60 points
-BAND1_MAX_DIFF = 20
-BAND1_SCORE_HIGH = 100
-BAND1_SCORE_LOW = 60
+# ---------------------------------------------------------------- live bands (spec 9)
+GREEN_MIN_SCORE = 80           # green 80-100
+AMBER_MIN_SCORE = 60           # amber 60-79, red 0-59
+BAND_HOLD_S = 0.3              # a new band must hold this long before it shows
+WORST_JOINT_WINDOW_S = 3.0
+# Old names, kept so other people's code does not break (degrees of error at the cut)
+GREEN_MAX_ERR = ERR_AT_ZERO_SCORE * (1 - GREEN_MIN_SCORE / 100)   # 10 deg
+AMBER_MAX_ERR = ERR_AT_ZERO_SCORE * (1 - AMBER_MIN_SCORE / 100)   # 20 deg
 
-# Band 2: 20 -> 40 degrees difference  =>  59 -> 20 points
-BAND2_MAX_DIFF = 40
-BAND2_SCORE_HIGH = 59
-BAND2_SCORE_LOW = 20
+# ---------------------------------------------------------------- events (spec 4-6)
+TIMING_TOLERANCE_S = 0.50      # T_i = clamp(100 * (1 - dt / 0.5))
+SHARPNESS_TOLERANCE_S = 0.50   # S_i
+HOLD_TOLERANCE_S = 0.50        # H_i
+EVENT_SMOOTH_SAMPLES = 5       # moving-average width before detecting events
+EVENT_MAX_GAP_S = 0.20         # a bigger gap in the data splits the series
+EVENT_STABLE_TOL_DEG = 5.0     # "stable" = within +-5 deg of where the run started
+EVENT_ARRIVAL_STABLE_S = 0.20  # must stay stable this long to count as arrived
+EVENT_MIN_MOVE_DEG = 20.0      # smaller changes are not a movement
+EVENT_MAX_MOVE_S = 1.5         # slower than this is not one clear movement
+HOLD_MIN_S = 0.30              # a stable pose this long is a hold
+EVENT_MATCH_WINDOW_S = 1.0     # user event must be this close to a reference event
 
-# Band 3: 40 -> BAND3_MAX_DIFF degrees difference  =>  19 -> 0 points
-# (BAND3_MAX_DIFF = 60 is my assumption; beyond it the score stays at 0)
-BAND3_MAX_DIFF = 60
-BAND3_SCORE_HIGH = 19
-BAND3_SCORE_LOW = 0
+# ---------------------------------------------------------------- combining (spec 8)
+COMPONENT_WEIGHTS = {"position": 0.75, "timing": 0.125, "sharpness": 0.0625, "holds": 0.0625}
 
-# (start_diff, end_diff, score_at_start, score_at_end) for each band
-SCORE_BANDS = [
-    (0,              BAND1_MAX_DIFF, BAND1_SCORE_HIGH, BAND1_SCORE_LOW),
-    (BAND1_MAX_DIFF, BAND2_MAX_DIFF, BAND2_SCORE_HIGH, BAND2_SCORE_LOW),
-    (BAND2_MAX_DIFF, BAND3_MAX_DIFF, BAND3_SCORE_HIGH, BAND3_SCORE_LOW),
-]
+# ---------------------------------------------------------------- data quality (spec 8.1, 15)
+MIN_POSITION_COVERAGE = 0.50   # below this, no confident overall score
+MIN_SECTION_SAMPLES = 5
+MIN_SESSION_SAMPLES = 20
+MIN_EVENTS_SECTION = 1         # fewer matched events = component unavailable
+MIN_EVENTS_SESSION = 2
+MIN_PART_SAMPLES = 10          # body-part score needs this many samples (session)
+MIN_PART_SAMPLES_SECTION = 3
+MIN_REF_TRACKED = 0.95         # warn if less of the reference clip is tracked
+LANDMARK_METRIC_ENABLED = False  # wrists / feet / head need landmarks (spec 8.2)
 
-# Display colours (BGR). Used for the skeleton and score text.
-COLOR_GOOD = (0, 200, 0)      # score >= BAND1_SCORE_LOW  (green)
-COLOR_OK = (0, 165, 255)      # score >= BAND2_SCORE_LOW  (orange)
-COLOR_BAD = (0, 0, 255)       # anything lower            (red)
+# ---------------------------------------------------------------- findings (spec 11)
+FINDINGS_MAX = 6
+FINDINGS_MAX_PER_TYPE = 3
+FINDING_MIN_LOSS = 15          # ignore issues that cost fewer than this many points
+FINDING_MIN_CONFIDENCE = 0.60
 
+# ---------------------------------------------------------------- feedback wording
+STATUS_STRONG = 85
+STATUS_GOOD = 70
+STATUS_IMPROVING = 55
 
-# =============================================================================
-# SCORE BAR (chess.com style) - tuning values
-# =============================================================================
+# ---------------------------------------------------------------- LLM (spec 10-13)
+LLM_MODEL = "claude-haiku-5-5"
+LLM_TIMEOUT_S = 4.0            # see note in the summary: the new JSON is big
+LLM_MAX_TOKENS = 1500
+LLM_STRICT_NUMBERS = True      # reject replies that contain numbers not in the input
+COACH_PERSONALITY = {"kindness": 0.8, "technicality": 0.7, "energy": 0.6, "directness": 0.5}
+
+# ---------------------------------------------------------------- balance bar (unchanged)
 BALANCE_BUCKET_S = 0.1
-BALANCE_AMBER_VALUE = 0.0    # orange counts as neutral; try 0.3 if the bar feels too harsh
-BALANCE_SMOOTH_S = 0.4       # smooth the overall score this long before it is banded
-# Cut-offs for what pushes the bar. These are the team spec's bands (green 80+,
-# amber 60-79, red below 60), NOT the skeleton colours, so the bar reacts to a
-# mediocre stretch instead of only to a disaster. (Using the skeleton cut-offs of
-# 60 / 20 makes red almost impossible, so the bar could only ever go up.)
-BALANCE_GREEN_MIN = 80
-BALANCE_AMBER_MIN = 60
-# How the bar is scaled:
-#   "running"    - divided by the time played SO FAR (but at least BALANCE_WARMUP_S),
-#                  so it rises and falls with how you are doing. Ends the same as
-#                  "whole_clip" once the video is over.
-#   "whole_clip" - divided by the whole video length: steadier but very slow, and it
-#                  can only reach full green at the very end.
-BALANCE_MODE = "running"
-BALANCE_WARMUP_S = 3.0       # "running" only: damps the swings in the first seconds
-
-# =============================================================================
-# RUN SCORES - position, timing, sharpness, holds
-# =============================================================================
-# OVERALL = 0.75 position + 0.125 timing + 0.0625 sharpness + 0.0625 holds. If one
-# can't be measured (e.g. no clear holds) it's left out and the others re-weighted.
-WEIGHT_POSITION = 0.75
-WEIGHT_TIMING = 0.125
-WEIGHT_SHARPNESS = 0.0625
-WEIGHT_HOLDS = 0.0625
-
-# Events are found in each segment's angle over time: a movement, its arrival, a hold.
-EVENT_SMOOTH_S = 0.15        # smooth the angle this long before measuring speed
-EVENT_MOVE_DPS = 30.0        # degrees/second above which a segment counts as moving
-EVENT_MIN_MOVE_S = 0.10      # a movement must last at least this long
-EVENT_MIN_AMPLITUDE = 10.0   # ...and change the angle by at least this many degrees
-EVENT_MERGE_GAP_S = 0.10     # movements closer than this are treated as one
-EVENT_STABLE_MIN_S = 0.15    # must stay still this long afterwards to count as arrived
-EVENT_MATCH_WINDOW_S = 1.0   # pair your arrival with the reference one within this gap
-EVENT_MAX_GAP_S = 0.25       # a gap in the data longer than this splits it into pieces
-TIMING_TOL_S = 0.50          # arrival 0.5 s apart = 0 points (0 s = 100)
-SHARPNESS_TOL_S = 0.50       # movement duration 0.5 s apart = 0 points
-HOLD_TOL_S = 0.50            # hold duration 0.5 s apart = 0 points
-MIN_EVENTS_PER_COMPONENT = 1 # fewer matched events than this -> "unavailable"
+BALANCE_AMBER_VALUE = 0.0

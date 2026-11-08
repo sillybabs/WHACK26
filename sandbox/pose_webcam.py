@@ -15,10 +15,20 @@ HOW IT WORKS
    angle (always 0-180 degrees, wrap-around handled). That difference is turned
    into a score from 0 to 100 using the point bands below.
 4. DISPLAY: live feed on the left, reference video on the right. Your skeleton
-   is coloured per segment (green = good, orange = so-so, red = off). A table
-   lists live angle, reference angle, difference and score per segment, plus the
-   overall score (the average of the segments) and AVG, the average overall
-   score since the video (re)started.
+   is coloured per segment (green = good, orange = so-so, red = off). Each
+   segment's score is written on the body, and a table lists live angle,
+   reference angle, difference and score per segment, plus the overall score
+   (the average of the segments) and AVG, the average overall score since the
+   video (re)started. In THIS version the big SCORE and AVG texts are hidden
+   (SHOW_OVERALL_SCORE / SHOW_AVG_SCORE = False); everything else is the same.
+5. RUN SCORES: while the reference plays, every scored frame is recorded. When the
+   run ends (video finishes / loops, or you quit) the console shows POSITION,
+   TIMING, SHARPNESS, HOLDS (each 0-100) and OVERALL - see "RUN SCORES" below.
+6. SCORE BAR (hidden in this version: SHOW_SCORE_BAR = False): a vertical bar on
+   the right edge of the live feed starts 50% green
+   / 50% red, like the evaluation bar on chess.com. Matching the video pushes it
+   towards green, missing pushes it towards red, and a perfect run ends fully
+   green. See the "SCORE BAR" section for how it is worked out.
 
 ANGLE CONVENTION
 ----------------
@@ -29,7 +39,7 @@ straight down, as seen on screen:
 Because only angle DIFFERENCES matter, the sign convention is just used
 consistently for both the live feed and the reference.
 
-SCORING (all tunable in the "SCORING" section)
+SCORING (all tunable in scoring/config.py)
 ----------------------------------------------
     difference 0-20 deg   -> 100 down to 60 points   (band 1)
     difference 20-40 deg  -> 59 down to 20 points    (band 2)
@@ -38,7 +48,7 @@ Inside a band the score falls in a straight line. Examples:
     10 deg off -> 80,  20 deg -> 60,  30 deg -> 39.5,  40 deg -> 20,  50 deg -> 9.5
 Band 3 needs an end point (the brief says "more than 40"), so I assumed it
 reaches 0 points at 60 deg difference and stays 0 beyond that. Change
-BAND3_MAX_DIFF if you want a gentler or harsher fall-off.
+BAND3_MAX_DIFF (in scoring/config.py) if you want a gentler or harsher fall-off.
 
 SETUP
 -----
@@ -61,7 +71,7 @@ CONTROLS (click the video window first so it has focus)
 -------------------------------------------------------
     q or ESC  quit
     SPACE     pause / resume the reference video
-    r         restart the reference video (with the countdown)
+    r         restart the reference video (with the countdown); resets the bar
 
 USAGE NOTES
 -----------
@@ -89,6 +99,23 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
+# The scoring code lives in /scoring, next to this /sandbox folder. Make the folder
+# above this script importable so "import scoring" works wherever you run from.
+try:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _SCRIPT_DIR = os.getcwd()
+_PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+
+from scoring import (  # noqa: E402
+    BalanceBar, RunRecorder, ScoreSmoother, balance_band, color_for_score, compare,
+    overall_score,
+)
+from scoring import finish_run as _finish_run  # noqa: E402
+from scoring.config import COLOR_BAD, COLOR_GOOD  # noqa: E402  (used by draw_score_bar)
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -109,39 +136,40 @@ PRINT_SCORES = True       # also print the scores to the console
 PRINT_INTERVAL = 0.5      # seconds between console prints
 
 # =============================================================================
-# SCORING - point ranges stored as variables
+# SCORING SETTINGS
 # =============================================================================
-# Each band covers a range of angle differences (in degrees). At the START of
-# the band you get *_SCORE_HIGH points, at the END you get *_SCORE_LOW points,
-# and in between the score falls linearly.
+# The point bands, colours, score-bar tuning and run-score weights all live in
+# scoring/config.py now. Edit them there.
 
-# Band 1: 0 -> 20 degrees difference  =>  100 -> 60 points
-BAND1_MAX_DIFF = 20
-BAND1_SCORE_HIGH = 100
-BAND1_SCORE_LOW = 60
+# =============================================================================
+# SCORE BAR (chess.com style)
+# =============================================================================
+# The bar starts 50% green / 50% red. Every moment of the reference video that
+# you match (green) pushes it towards green, every moment you miss (red) pushes
+# it towards red. A perfect run ends fully green; a run of misses ends fully red.
+#
+#   bar = 0.5 + 0.5 * (sum of moments / moments counted)   (see BALANCE_MODE)
+#   green moment = +1, orange = BALANCE_AMBER_VALUE, red = -1
+#
+# Moments are stored by REFERENCE VIDEO TIME (0.1 s buckets), so replaying a
+# stretch overwrites it instead of adding to it. Pausing never counts.
+SHOW_SCORE_BAR = False       # False = the bar is not displayed (set True to bring it back)
+SHOW_PART_SCORES = True      # write each segment's score on the body as well as in the table
+SHOW_OVERALL_SCORE = False   # the big "SCORE: nn" text at the bottom left of the live feed
+SHOW_AVG_SCORE = False       # the "AVG: nn" text above it
+# (BALANCE_* tuning values for the bar are in scoring/config.py)
 
-# Band 2: 20 -> 40 degrees difference  =>  59 -> 20 points
-BAND2_MAX_DIFF = 40
-BAND2_SCORE_HIGH = 59
-BAND2_SCORE_LOW = 20
+# Optional hook so other code can receive the scores. Set it to a function that
+# takes one dict:  {"time", "overall", "parts": {segment: score or None}, "balance"}
+# It is called once per frame while the reference is playing and a person is seen.
+SCORE_CALLBACK = None
 
-# Band 3: 40 -> BAND3_MAX_DIFF degrees difference  =>  19 -> 0 points
-# (BAND3_MAX_DIFF = 60 is my assumption; beyond it the score stays at 0)
-BAND3_MAX_DIFF = 60
-BAND3_SCORE_HIGH = 19
-BAND3_SCORE_LOW = 0
-
-# (start_diff, end_diff, score_at_start, score_at_end) for each band
-SCORE_BANDS = [
-    (0,              BAND1_MAX_DIFF, BAND1_SCORE_HIGH, BAND1_SCORE_LOW),
-    (BAND1_MAX_DIFF, BAND2_MAX_DIFF, BAND2_SCORE_HIGH, BAND2_SCORE_LOW),
-    (BAND2_MAX_DIFF, BAND3_MAX_DIFF, BAND3_SCORE_HIGH, BAND3_SCORE_LOW),
-]
-
-# Display colours (BGR). Used for the skeleton and score text.
-COLOR_GOOD = (0, 200, 0)      # score >= BAND1_SCORE_LOW  (green)
-COLOR_OK = (0, 165, 255)      # score >= BAND2_SCORE_LOW  (orange)
-COLOR_BAD = (0, 0, 255)       # anything lower            (red)
+# =============================================================================
+# RUN SCORE HOOK
+# =============================================================================
+# Optional hook: set to a function taking one dict (the run scores above) - called
+# once when a run ends.
+RUN_SCORE_CALLBACK = None
 
 # =============================================================================
 # MODEL
@@ -187,29 +215,12 @@ HEAD_SEGMENT = ("head", (7, 8), (11, 12))  # ear midpoint -> shoulder midpoint
 
 
 # =============================================================================
-# SCORING FUNCTIONS
 # =============================================================================
-def angle_diff(live, ref):
-    """Signed difference live - ref, wrapped to -180..180 (so +179 vs -179 = 2)."""
-    return (live - ref + 180) % 360 - 180
-
-
-def score_diff(diff):
-    """Turn an angle difference (degrees, sign ignored) into 0-100 points."""
-    d = abs(diff)
-    for start, end, score_high, score_low in SCORE_BANDS:
-        if d <= end:
-            t = (d - start) / (end - start)  # 0 at band start, 1 at band end
-            return score_high + t * (score_low - score_high)
-    return BAND3_SCORE_LOW  # past the last band
-
-
-def color_for_score(score):
-    if score >= BAND1_SCORE_LOW:
-        return COLOR_GOOD
-    if score >= BAND2_SCORE_LOW:
-        return COLOR_OK
-    return COLOR_BAD
+# SCORING HOOKS
+# =============================================================================
+def finish_run(recorder, complete=True):
+    """Score the finished run (see scoring/run_scores.py) and call RUN_SCORE_CALLBACK."""
+    return _finish_run(recorder, complete, callback=RUN_SCORE_CALLBACK)
 
 
 # =============================================================================
@@ -259,34 +270,6 @@ def segment_angles(segs):
     }
 
 
-# =============================================================================
-# COMPARISON
-# =============================================================================
-def compare(live_angles, ref_angles):
-    """Score every segment. Returns {name: dict or None}.
-
-    Each dict has: live, ref (angles), diff (signed, wrapped), score (0-100).
-    A segment is None if it isn't visible in the live feed or the reference
-    (or if the reference has no person in the current frame).
-    """
-    results = {}
-    for name, live in live_angles.items():
-        ref = ref_angles.get(name)
-        if live is None or ref is None:
-            results[name] = None
-            continue
-        diff = angle_diff(live, ref)
-        results[name] = {
-            "live": live, "ref": ref, "diff": diff, "score": score_diff(diff),
-        }
-    return results
-
-
-def overall_score(results):
-    """Average score of all segments that could be compared (None if none)."""
-    scores = [r["score"] for r in results.values() if r is not None]
-    return sum(scores) / len(scores) if scores else None
-
 
 # =============================================================================
 # DRAWING
@@ -321,6 +304,39 @@ def _text(frame, s, pos, color=(255, 255, 255), scale=0.5, thick=1):
                 thick, cv2.LINE_AA)
 
 
+def draw_part_scores(frame, segs, results):
+    """Write each segment's score on the body, halfway along the segment."""
+    for name, r in results.items():
+        if r is None:
+            continue
+        p, q = segs[name]
+        pos = (int((p[0] + q[0]) / 2) + 6, int((p[1] + q[1]) / 2))
+        s = f"{r['score']:.0f}"
+        _text(frame, s, pos, (0, 0, 0), 0.55, 4)                      # dark outline
+        _text(frame, s, pos, color_for_score(r["score"]), 0.55, 2)    # coloured number
+
+
+def draw_score_bar(frame, value):
+    """Vertical green/red bar on the right edge. value = green share, 0..1."""
+    h, w = frame.shape[:2]
+    bar_w = 26
+    x1 = w - 14
+    x0 = x1 - bar_w
+    y0, y1 = 70, h - 70
+    fill_y = int(y1 - (y1 - y0) * value)
+
+    cv2.rectangle(frame, (x0, y0), (x1, y1), COLOR_BAD, -1)         # red = misses
+    cv2.rectangle(frame, (x0, fill_y), (x1, y1), COLOR_GOOD, -1)    # green rises from the bottom
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), 2)
+    mid = (y0 + y1) // 2
+    cv2.line(frame, (x0 - 5, mid), (x1 + 5, mid), (255, 255, 255), 2)  # the 50/50 line
+
+    # The percentage is written as a number too, so it never relies on colour alone
+    label = f"{value * 100:.0f}%"
+    _text(frame, label, (w - 76, y0 - 12), (0, 0, 0), 0.7, 4)
+    _text(frame, label, (w - 76, y0 - 12), (255, 255, 255), 0.7, 2)
+
+
 def draw_panel(frame, results, overall):
     """Table of live angle / reference angle / difference / score per segment."""
     x0, y0, row_h = 5, 45, 21
@@ -350,7 +366,7 @@ def draw_panel(frame, results, overall):
         _text(frame, f"{r['diff']:+.0f}", (cols[3], y))
         _text(frame, f"{r['score']:.0f}", (cols[4], y), col, 0.55, 2)
 
-    if overall is not None:
+    if SHOW_OVERALL_SCORE and overall is not None:
         h = frame.shape[0]
         _text(frame, f"SCORE: {overall:.0f}", (10, h - 15),
               color_for_score(overall), 1.0, 3)
@@ -554,6 +570,9 @@ def main(video_path=None):
     path = resolve_path(video_path or REFERENCE_VIDEO)
     data, ref_fps = analyse_reference(path)
     player = ReferencePlayer(path, data, ref_fps)
+    balance = BalanceBar(player.n / player.fps)   # the chess.com-style bar
+    smoother = ScoreSmoother()
+    recorder = RunRecorder(data, ref_fps)         # position / timing / sharpness / holds
 
     options = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -589,9 +608,15 @@ def main(video_path=None):
                 frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
 
-            # Advance the reference video; a loop restarts the running average
+            # Advance the reference video; a loop restarts the running average and the bar
             if player.update(dt):
+                finish_run(recorder)                  # the run that just ended
+                recorder = RunRecorder(data, ref_fps)
                 score_sum, score_count = 0.0, 0
+                balance.reset()
+                smoother.reset()
+            elif player.finished:                     # LOOP_REFERENCE = False: video ended
+                finish_run(recorder)
             _, ref_angles = player.current
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -611,12 +636,29 @@ def main(video_path=None):
                 overall = overall_score(results)
 
                 draw_segment_colors(frame, segs, results)
+                if SHOW_PART_SCORES:
+                    draw_part_scores(frame, segs, results)
                 draw_panel(frame, results, overall)
 
                 # Only count scores while the reference is really playing
                 if overall is not None and player.playing:
                     score_sum += overall
                     score_count += 1
+                    recorder.record(player.time, results, overall)
+
+                    # Score bar: smooth the overall score, band it, store it at this video time
+                    smooth = smoother.update(overall, time.time())
+                    balance.record(player.time, balance_band(smooth))
+
+                    # Hand the per-body-part scores to anyone who asked for them
+                    if SCORE_CALLBACK is not None:
+                        SCORE_CALLBACK({
+                            "time": player.time,
+                            "overall": overall,
+                            "parts": {n: (r["score"] if r else None)
+                                      for n, r in results.items()},
+                            "balance": balance.value,
+                        })
 
                 if PRINT_SCORES and time.time() - last_print >= PRINT_INTERVAL:
                     last_print = time.time()
@@ -625,9 +667,13 @@ def main(video_path=None):
                         for n, r in results.items()
                     ]
                     total = f"{overall:.0f}" if overall is not None else "--"
-                    print(f"TOTAL {total} | " + " | ".join(parts))
+                    bar_txt = f"BAR {balance.value * 100:.0f}% | " if SHOW_SCORE_BAR else ""
+                    print(f"TOTAL {total} | {bar_txt}" + " | ".join(parts))
 
-            if score_count:
+            if SHOW_SCORE_BAR:
+                draw_score_bar(frame, balance.value)
+
+            if SHOW_AVG_SCORE and score_count:
                 avg = score_sum / score_count
                 _text(frame, f"AVG: {avg:.0f}", (10, h - 55),
                       color_for_score(avg), 0.8, 2)
@@ -654,6 +700,9 @@ def main(video_path=None):
             elif key == ord("r"):
                 player.restart()
                 score_sum, score_count = 0.0, 0
+                balance.reset()
+                smoother.reset()
+                recorder = RunRecorder(data, ref_fps)   # discard the run so far
 
             # Cap the frame rate by sleeping off any leftover frame time
             elapsed = time.time() - loop_start
@@ -663,8 +712,11 @@ def main(video_path=None):
     cap.release()
     player.release()
     cv2.destroyAllWindows()
+    finish_run(recorder, complete=False)   # a run stopped early is still reported
     if score_count:
         print(f"Average score: {score_sum / score_count:.0f}")
+        if SHOW_SCORE_BAR:
+            print(f"Final score bar: {balance.value * 100:.0f}% green")
 
 
 if __name__ == "__main__":
